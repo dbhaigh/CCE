@@ -1,0 +1,22 @@
+{
+  "name": "code-compiler-empire",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "demo:vertical-slice": "npm run build && node dist/src/examples/run-vertical-slice.js",
+    "test": "npm run build && node --test dist/test/simulation.test.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2",
+    "typescript": "^5.9.2"
+  }
+}
