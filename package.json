@@ -1,6 +1,6 @@
 {
   "name": "code-compiler-empire",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "private": true,
   "type": "module",
   "exports": {
@@ -10,13 +10,32 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "demo:vertical-slice": "npm run build && node dist/src/examples/run-vertical-slice.js",
-    "test": "npm run build && node --test dist/test/simulation.test.js",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "dev": "vite",
+    "build": "npm run build:core && npm run build:web",
+    "build:core": "tsc -p tsconfig.json",
+    "build:web": "tsc -p tsconfig.web.json && vite build",
+    "demo:vertical-slice": "npm run build:core && node dist/src/simulation/examples/run-vertical-slice.js",
+    "test": "npm run build:core && node --test dist/test/*.test.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.web.json",
+    "tauri": "tauri",
+    "desktop:dev": "tauri dev",
+    "desktop:build": "tauri build"
+  },
+  "dependencies": {
+    "@radix-ui/react-tabs": "^1.1.13",
+    "@tauri-apps/api": "^2.0.0",
+    "lucide-react": "^0.468.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
   },
   "devDependencies": {
+    "@tailwindcss/vite": "^4.0.0",
+    "@tauri-apps/cli": "^2.0.0",
     "@types/node": "^24.5.2",
-    "typescript": "^5.9.2"
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.9.2",
+    "vite": "^7.0.0"
   }
 }

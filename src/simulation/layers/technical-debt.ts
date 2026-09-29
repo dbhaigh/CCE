@@ -1,5 +1,6 @@
 import {
   SimulationPhase,
+  type CommandHandler,
   type SimulationSystem,
   type SimulationView,
   type SystemUpdate,
@@ -32,6 +33,25 @@ export interface TechnicalDebtState extends JsonObject {
   readonly interestIncidents: number;
   readonly peakDebt: number;
   readonly principalByCategory: Readonly<Record<string, number>>;
+  readonly lastRemediation?: DebtRemediation;
+  readonly manualPaydown?: { readonly categoryId: string; readonly amount: number } | null;
+  readonly lastManualPaydown?: {
+    readonly tick: number;
+    readonly categoryId: string;
+    readonly requested: number;
+    readonly retired: number;
+    readonly capacitySpent: number;
+    readonly moneySpent: number;
+  };
+}
+
+export interface DebtRemediation extends JsonObject {
+  readonly availableCapacity: number;
+  readonly capacitySpent: number;
+  readonly maintainable: number;
+  readonly affordableDebt: number;
+  readonly retired: number;
+  readonly debtBefore: number;
 }
 
 export interface TechnicalDebtLayerOptions {
@@ -68,7 +88,7 @@ class TechnicalDebtSystem
     "build.failed",
     "research.completed",
   ];
-  public readonly emits = ["debt.maintained", "debt.interest-accrued"];
+  public readonly emits = ["debt.maintained", "debt.interest-accrued", "debt.manual-paydown"];
 
   public constructor(private readonly options: TechnicalDebtLayerOptions) {}
 
@@ -133,7 +153,34 @@ class TechnicalDebtSystem
             view.resources.get(Resources.Money) /
               this.options.moneyPerDebtRetired,
           );
-    const trackedPrincipal = Object.values(principalByCategory).reduce(
+    const knowledgeEfficiency = Math.min(
+      2_000,
+      1_000 + view.resources.get(Resources.Knowledge) * 5,
+    );
+    const manual = state.manualPaydown;
+    const manualCategory = state.categories.find((category) => category.id === manual?.categoryId);
+    const manualPotential = manualCategory === undefined ? 0 : Math.floor(
+      (maintenanceCapacity * this.options.debtPerMaintenanceCapacity *
+        knowledgeEfficiency * manualCategory.maintenanceEfficiencyPermille) / 1_000_000,
+    );
+    const manualRetired = manual === null || manual === undefined ? 0 : Math.min(
+      manual.amount, principalByCategory[manual.categoryId] ?? 0,
+      affordableDebt, manualPotential,
+    );
+    const manualCapacitySpent = manualRetired === 0 || manualCategory === undefined ? 0 :
+      Math.min(maintenanceCapacity, Math.ceil(
+        (manualRetired * 1_000_000) /
+        (this.options.debtPerMaintenanceCapacity *
+          knowledgeEfficiency * manualCategory.maintenanceEfficiencyPermille),
+      ));
+    const afterManual = { ...principalByCategory };
+    if (manual !== null && manual !== undefined) {
+      afterManual[manual.categoryId] = (afterManual[manual.categoryId] ?? 0) - manualRetired;
+    }
+    const automaticCapacity = maintenanceCapacity - manualCapacitySpent;
+    const automaticDebt = debt - manualRetired;
+    const automaticAffordable = affordableDebt - manualRetired;
+    const trackedPrincipal = Object.values(afterManual).reduce(
       (total, principal) => total + principal,
       0,
     );
@@ -144,28 +191,24 @@ class TechnicalDebtSystem
             state.categories.reduce(
               (total, category) =>
                 total +
-                (principalByCategory[category.id] ?? 0) *
+                (afterManual[category.id] ?? 0) *
                   category.maintenanceEfficiencyPermille,
               0,
             ) / trackedPrincipal,
           );
-    const knowledgeEfficiency = Math.min(
-      2_000,
-      1_000 + view.resources.get(Resources.Knowledge) * 5,
-    );
     const maintainable = Math.floor(
-      (maintenanceCapacity *
+      (automaticCapacity *
         this.options.debtPerMaintenanceCapacity *
         knowledgeEfficiency *
         averageMaintenanceEfficiency) /
         1_000_000,
     );
-    const retired = Math.min(debt, maintainable, affordableDebt);
+    const retired = Math.min(automaticDebt, maintainable, automaticAffordable);
     const capacitySpent =
       retired === 0
         ? 0
         : Math.min(
-            maintenanceCapacity,
+            automaticCapacity,
             Math.ceil(
               (retired * 1_000) /
                 (this.options.debtPerMaintenanceCapacity *
@@ -178,9 +221,10 @@ class TechnicalDebtSystem
                   )),
             ),
           );
-    const remainingDebt = debt - retired;
+    const totalRetired = manualRetired + retired;
+    const remainingDebt = debt - totalRetired;
     const remainingPrincipalByCategory = this.retireDebt(
-      principalByCategory,
+      afterManual,
       state.categories,
       retired,
     );
@@ -198,10 +242,18 @@ class TechnicalDebtSystem
       interestPressure / this.options.debtPerInterestBug,
     );
     const events = [];
-    if (retired > 0) {
+    if (totalRetired > 0) {
       events.push({
         type: "debt.maintained",
-        payload: { retired, remainingDebt },
+        payload: { retired: totalRetired, remainingDebt },
+      });
+    }
+    if (manual !== null && manual !== undefined) {
+      events.push({
+        type: "debt.manual-paydown",
+        payload: { categoryId: manual.categoryId, requested: manual.amount,
+          retired: manualRetired, capacitySpent: manualCapacitySpent,
+          moneySpent: manualRetired * this.options.moneyPerDebtRetired },
       });
     }
     if (interestBugs > 0) {
@@ -215,17 +267,17 @@ class TechnicalDebtSystem
       resources: [
         {
           resource: Resources.TechnicalDebt,
-          amount: -retired,
+          amount: -totalRetired,
           reason: "Maintenance work",
         },
         {
           resource: Resources.MaintenanceCapacity,
-          amount: -capacitySpent,
+          amount: -(manualCapacitySpent + capacitySpent),
           reason: "Debt remediation",
         },
         {
           resource: Resources.Money,
-          amount: -(retired * this.options.moneyPerDebtRetired),
+          amount: -(totalRetired * this.options.moneyPerDebtRetired),
           reason: "Maintenance cost",
         },
         {
@@ -235,15 +287,31 @@ class TechnicalDebtSystem
         },
         {
           resource: Resources.Insight,
-          amount: Math.floor(retired / 2),
+          amount: Math.floor(totalRetired / 2),
           reason: "Maintenance learning",
         },
       ],
       statePatch: {
-        retired: state.retired + retired,
+        retired: state.retired + totalRetired,
         interestIncidents: state.interestIncidents + interestBugs,
         peakDebt: Math.max(state.peakDebt, debt),
         principalByCategory: remainingPrincipalByCategory,
+        lastRemediation: {
+          availableCapacity: maintenanceCapacity,
+          capacitySpent: manualCapacitySpent + capacitySpent,
+          maintainable: manualPotential + maintainable,
+          affordableDebt,
+          retired: totalRetired,
+          debtBefore: debt,
+        },
+        manualPaydown: null,
+        ...(manual === null || manual === undefined ? {} : {
+          lastManualPaydown: {
+            tick: view.tick, categoryId: manual.categoryId, requested: manual.amount,
+            retired: manualRetired, capacitySpent: manualCapacitySpent,
+            moneySpent: manualRetired * this.options.moneyPerDebtRetired,
+          },
+        }),
       },
       events,
     };
@@ -275,6 +343,40 @@ class TechnicalDebtSystem
   }
 }
 
+interface PayDownPayload extends JsonObject {
+  readonly categoryId: string;
+  readonly amount: number;
+}
+
+function createManualPaydownHandler(): CommandHandler<PayDownPayload> {
+  return {
+    id: TECHNICAL_DEBT_SYSTEM_ID,
+    type: "debt.pay-down",
+    reads: [Resources.TechnicalDebt],
+    writes: [],
+    stateReads: [],
+    eventReads: [],
+    emits: [],
+    handle: (command, view) => {
+      const { categoryId, amount } = command.payload;
+      if (!Number.isSafeInteger(amount) || amount < 1 || amount > 1_000) {
+        throw new Error("Manual paydown amount must be an integer from 1 to 1000");
+      }
+      const state = view.getSystemState<TechnicalDebtState>(TECHNICAL_DEBT_SYSTEM_ID);
+      if (state.manualPaydown !== undefined && state.manualPaydown !== null) {
+        throw new Error("A manual debt paydown is already scheduled this tick");
+      }
+      if (!state.categories.some((category) => category.id === categoryId)) {
+        throw new Error(`Unknown debt category: ${categoryId}`);
+      }
+      if (view.resources.get(Resources.TechnicalDebt) === 0) {
+        throw new Error("There is no debt to pay down");
+      }
+      return { statePatch: { manualPaydown: { categoryId, amount } } };
+    },
+  };
+}
+
 export function createTechnicalDebtLayer(
   options: TechnicalDebtLayerOptions,
 ): SimulationLayer {
@@ -294,7 +396,7 @@ export function createTechnicalDebtLayer(
       outputs: [Resources.Bugs, Resources.Insight],
     },
     systems: [new TechnicalDebtSystem(options)],
-    commandHandlers: [],
+    commandHandlers: [createManualPaydownHandler()],
     eventHandlers: [],
     feedbackLoops: [
       "Debt slows source and builds and creates defects; organization policy reserves maintenance capacity to retire it.",

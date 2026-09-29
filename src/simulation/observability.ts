@@ -11,7 +11,7 @@ import type {
   OrganizationPolicy,
 } from "./layers/organization.js";
 import type { SourceGenerationState } from "./layers/source-generation.js";
-import type { TechnicalDebtState } from "./layers/technical-debt.js";
+import type { DebtRemediation, TechnicalDebtState } from "./layers/technical-debt.js";
 
 export interface DebtHeatmapCell extends JsonObject {
   readonly categoryId: string;
@@ -62,6 +62,7 @@ export interface RollingBottleneckMetric extends JsonObject {
 export interface TeamProductivityMetric extends JsonObject {
   readonly teamId: string;
   readonly headcount: number;
+  readonly fundedPeople: number;
   readonly sourceCapacity: number;
   readonly moralePermille: number;
   readonly engineeringSkillPermille: number;
@@ -84,6 +85,7 @@ export interface SimulationDiagnostics extends JsonObject {
     readonly total: number;
     readonly peak: number;
     readonly retired: number;
+    readonly remediation: DebtRemediation | null;
     readonly heatmap: readonly DebtHeatmapCell[];
   };
   readonly pipeline: {
@@ -194,6 +196,7 @@ export function createSimulationDiagnostics(
       total: totalDebt,
       peak: debt.peakDebt,
       retired: debt.retired,
+      remediation: debt.lastRemediation ?? null,
       heatmap,
     },
     pipeline: {
@@ -215,6 +218,7 @@ export function createSimulationDiagnostics(
         return {
           teamId: team.id,
           headcount: team.headcount,
+          fundedPeople: allocation?.fundedPeople ?? 0,
           sourceCapacity: allocation?.capacity ?? 0,
           moralePermille: team.moralePermille,
           engineeringSkillPermille: team.engineeringSkillPermille,

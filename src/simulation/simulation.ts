@@ -83,7 +83,7 @@ export interface AnalyticalOfflineModel {
 }
 
 export interface SimulationSnapshot {
-  readonly schemaVersion: 2 | 3 | 4;
+  readonly schemaVersion: 2 | 3 | 4 | 5 | 6;
   readonly gameVersion: string;
   readonly contentHash: string;
   readonly seed: string;
@@ -97,6 +97,7 @@ export interface SimulationSnapshot {
   readonly queuedCommands: readonly GameCommand[];
   readonly pendingEvents: readonly DomainEvent[];
   readonly durableEvents?: readonly DomainEvent[];
+  readonly importantEvents?: readonly DomainEvent[];
 }
 
 export interface AdvanceResult {
@@ -127,6 +128,12 @@ export interface SystemExecutionMetric extends JsonObject {
   readonly bottleneck: string | null;
 }
 
+export interface ResourceFlowTotals {
+  readonly produced: Readonly<Record<string, number>>;
+  readonly consumed: Readonly<Record<string, number>>;
+  readonly discontinuities: number;
+}
+
 interface TickResult {
   readonly commandResults: readonly CommandResult[];
   readonly events: readonly DomainEvent[];
@@ -134,11 +141,14 @@ interface TickResult {
 
 interface TickJournal {
   readonly resourceChanges: ResourceBalanceChange[];
+  readonly resourceProduced?: Map<ResourceId, number>;
+  readonly resourceConsumed?: Map<ResourceId, number>;
   readonly previousStates: Map<SystemId, JsonValue>;
   readonly removedCommands: GameCommand[];
   readonly previousCurrentEvents: DomainEvent[];
   readonly previousPendingEvents: DomainEvent[];
   readonly previousDurableEvents: DomainEvent[];
+  readonly previousImportantEvents: DomainEvent[];
   readonly previousEmittedEvents: DomainEvent[];
   readonly nextEventSequence: number;
 }
@@ -152,7 +162,28 @@ interface AccessDeclaration {
   readonly emits: readonly string[];
 }
 
-const SNAPSHOT_SCHEMA_VERSION = 4;
+interface PreparedAccess extends AccessDeclaration {
+  readonly allowedResources: ReadonlySet<ResourceId>;
+  readonly allowedWrites: ReadonlySet<ResourceId>;
+  readonly allowedStates: ReadonlySet<SystemId>;
+  readonly eventTypes: ReadonlySet<string>;
+}
+
+const SNAPSHOT_SCHEMA_VERSION = 6;
+const IMPORTANT_EVENT_LIMIT = 64;
+const IMPORTANT_EVENT_TYPES = new Set([
+  "build.job-queued", "build.job-reordered", "build.job-cancelled", "build.job-completed",
+  "build.hardware-selected", "organization.team-staffed", "organization.swarm-staffed",
+  "organization.team-role-assigned", "organization.swarm-configured",
+  "organization.team-trained", "organization.policy-updated",
+  "organization.team-policy-updated", "organization.team-policy-cleared",
+  "research.completed", "research.selected", "research.upgrade-purchased", "crisis.protocol-updated",
+  "debt.manual-paydown", "crisis.detected", "crisis.resolved", "crisis.escalated",
+  "debt.interest-accrued", "runtime.incident", "runtime.strategy-updated",
+]);
+const THROTTLED_EVENT_TYPES = new Set([
+  "crisis.resolved", "crisis.escalated", "debt.interest-accrued", "runtime.incident",
+]);
 
 export class Simulation {
   private readonly seed: string;
@@ -166,6 +197,11 @@ export class Simulation {
   private readonly metricsSampleIntervalTicks: number;
   private readonly systems: ReadonlyMap<SystemId, SimulationSystem>;
   private readonly executionPlan: ExecutionPlan;
+  private readonly systemAccess = new Map<SystemId, PreparedAccess>();
+  private readonly executionStages: readonly {
+    readonly run: readonly { system: SimulationSystem; access: PreparedAccess }[];
+    readonly commitOrder: readonly number[];
+  }[];
   private readonly commandHandlers = new Map<string, CommandHandler>();
   private readonly eventHandlers = new Map<string, readonly EventHandler[]>();
   private readonly resourceRegistry: ResourceRegistry;
@@ -181,9 +217,13 @@ export class Simulation {
   private emittedEvents: DomainEvent[] = [];
   private pendingEvents: DomainEvent[] = [];
   private durableEvents: DomainEvent[] = [];
+  private importantEvents: DomainEvent[] = [];
   private activeJournal: TickJournal | undefined;
   private lastTickWasQuiescent = false;
   private readonly systemMetrics: SystemExecutionMetric[] = [];
+  private resourceProduced: Map<ResourceId, number> | null = null;
+  private resourceConsumed: Map<ResourceId, number> | null = null;
+  private flowDiscontinuities = 0;
 
   public constructor(
     private readonly configuration: SimulationConfiguration,
@@ -290,6 +330,26 @@ export class Simulation {
       configuration.systems,
       configuration.pipelines,
     );
+    for (const system of configuration.systems) {
+      this.systemAccess.set(system.id, this.prepareAccess({
+        owner: system.id,
+        reads: system.reads,
+        writes: system.writes,
+        stateReads: system.stateReads,
+        eventReads: system.eventReads,
+        emits: system.emits,
+      }));
+    }
+    this.executionStages = this.executionPlan.stages.map((stage) => {
+      const run = stage.systems.map((system) => {
+        const access = this.systemAccess.get(system.id);
+        if (access === undefined) throw new Error(`Missing access declaration for ${system.id}`);
+        return { system, access };
+      });
+      const commitOrder = run.map((_, index) => index)
+        .sort((left, right) => run[left]!.system.id.localeCompare(run[right]!.system.id));
+      return { run, commitOrder };
+    });
 
     for (const handler of configuration.commandHandlers ?? []) {
       if (this.commandHandlers.has(handler.type)) {
@@ -345,6 +405,7 @@ export class Simulation {
           delivery: "durable" as const,
         })),
       );
+      this.importantEvents = (snapshot.importantEvents ?? []).map(cloneJson);
 
       for (const system of configuration.systems) {
         const state = snapshot.systemStates[system.id];
@@ -363,6 +424,10 @@ export class Simulation {
     return this.currentTick;
   }
 
+  public get timeRemainder(): number {
+    return this.scaledTimeRemainder;
+  }
+
   public get plan(): ExecutionPlan {
     return this.executionPlan;
   }
@@ -375,8 +440,27 @@ export class Simulation {
     return this.currentEvents;
   }
 
+  public getImportantEvents(): readonly DomainEvent[] {
+    return this.importantEvents;
+  }
+
   public getRecentSystemMetrics(): readonly SystemExecutionMetric[] {
     return this.systemMetrics;
+  }
+
+  public enableResourceFlowTelemetry(): void {
+    if (this.resourceProduced !== null) return;
+    this.resourceProduced = new Map();
+    this.resourceConsumed = new Map();
+  }
+
+  public getResourceFlowTotals(): ResourceFlowTotals | null {
+    if (this.resourceProduced === null || this.resourceConsumed === null) return null;
+    return {
+      produced: Object.fromEntries(this.resourceProduced),
+      consumed: Object.fromEntries(this.resourceConsumed),
+      discontinuities: this.flowDiscontinuities,
+    };
   }
 
   public getState<State extends JsonValue>(
@@ -405,6 +489,14 @@ export class Simulation {
     try {
       const result = this.executeTick();
       this.lastTickWasQuiescent = this.isJournalQuiescent(journal, result);
+      if (this.resourceProduced !== null && this.resourceConsumed !== null) {
+        for (const [resource, amount] of journal.resourceProduced ?? []) {
+          this.resourceProduced.set(resource, (this.resourceProduced.get(resource) ?? 0) + amount);
+        }
+        for (const [resource, amount] of journal.resourceConsumed ?? []) {
+          this.resourceConsumed.set(resource, (this.resourceConsumed.get(resource) ?? 0) + amount);
+        }
+      }
       this.activeJournal = undefined;
       return result;
     } catch (error) {
@@ -430,25 +522,20 @@ export class Simulation {
     const collectMetrics =
       tick % this.metricsSampleIntervalTicks === 0;
 
-    for (const stage of this.executionPlan.stages) {
-      const updates = stage.systems.map((system) => ({
+    for (const stage of this.executionStages) {
+      const updates = stage.run.map(({ system, access }) => ({
         system,
+        access,
         update: system.run(
-          this.createView(tick, {
-            owner: system.id,
-            reads: system.reads,
-            writes: system.writes,
-            stateReads: system.stateReads,
-            eventReads: system.eventReads,
-            emits: system.emits,
-          }),
+          this.createView(tick, access),
           this.createContext(tick, system.id),
         ),
       }));
 
-      for (const { system, update } of updates.sort((left, right) =>
-        left.system.id.localeCompare(right.system.id),
-      )) {
+      for (const index of stage.commitOrder) {
+        const entry = updates[index];
+        if (entry === undefined) throw new Error("Execution stage lost a system");
+        const { system, access, update } = entry;
         if (collectMetrics) {
           const resourceFlow = (update?.resources ?? []).reduce(
             (total, mutation) => total + Math.abs(mutation.amount),
@@ -473,19 +560,7 @@ export class Simulation {
             bottleneck: update?.telemetry?.bottleneck ?? null,
           });
         }
-        this.commitUpdate(
-          {
-            owner: system.id,
-            reads: system.reads,
-            writes: system.writes,
-            stateReads: system.stateReads,
-            eventReads: system.eventReads,
-            emits: system.emits,
-          },
-          update,
-          tick,
-          "current",
-        );
+        this.commitUpdate(access, update, tick, "current");
       }
     }
 
@@ -493,6 +568,13 @@ export class Simulation {
     if (collectMetrics) {
       this.recordSystemMetrics(tickMetrics);
     }
+    const logged = [...this.emittedEvents, ...this.durableEvents, ...this.pendingEvents].filter((event) => {
+      if (event.tick !== tick || !IMPORTANT_EVENT_TYPES.has(event.type)) return false;
+      if (!THROTTLED_EVENT_TYPES.has(event.type)) return true;
+      return !this.importantEvents.some((entry) =>
+        entry.type === event.type && tick - entry.tick < 30);
+    });
+    if (logged.length > 0) this.importantEvents = [...this.importantEvents, ...logged].slice(-IMPORTANT_EVENT_LIMIT);
     this.currentTick = tick;
     return {
       commandResults,
@@ -599,6 +681,7 @@ export class Simulation {
       queuedCommands: this.queuedCommands.map(cloneJson),
       pendingEvents: this.pendingEvents.map(cloneJson),
       durableEvents: this.durableEvents.map(cloneJson),
+      importantEvents: this.importantEvents.map(cloneJson),
     };
   }
 
@@ -701,22 +784,20 @@ export class Simulation {
     tick: SimTick,
     access: AccessDeclaration,
   ): SimulationView {
-    const allowedStates = new Set([access.owner, ...access.stateReads]);
-    const allowedResources = [...new Set([...access.reads, ...access.writes])];
-    const eventTypes = new Set(access.eventReads);
+    const prepared = this.prepareAccess(access);
     return {
       tick,
-      resources: this.resourceRegistry.view(allowedResources),
+      resources: this.resourceRegistry.viewPrepared(prepared.allowedResources),
       events:
-        eventTypes.size === 0
+        prepared.eventTypes.size === 0
           ? []
-          : [...eventTypes].flatMap(
+          : [...prepared.eventTypes].flatMap(
               (type) => this.currentEventsByType.get(type) ?? [],
             ).sort((left, right) => left.sequence - right.sequence),
       getSystemState: <State extends JsonValue>(
         id: SystemId,
       ): DeepReadonly<State> => {
-        if (!allowedStates.has(id)) {
+        if (!prepared.allowedStates.has(id)) {
           throw new Error(
             `System ${access.owner} attempted undeclared state read from ${id}`,
           );
@@ -727,6 +808,17 @@ export class Simulation {
         }
         return state as DeepReadonly<State>;
       },
+    };
+  }
+
+  private prepareAccess(access: AccessDeclaration): PreparedAccess {
+    if ("allowedWrites" in access) return access as PreparedAccess;
+    return {
+      ...access,
+      allowedResources: new Set([...access.reads, ...access.writes]),
+      allowedWrites: new Set(access.writes),
+      allowedStates: new Set([access.owner, ...access.stateReads]),
+      eventTypes: new Set(access.eventReads),
     };
   }
 
@@ -748,7 +840,7 @@ export class Simulation {
       return;
     }
 
-    const allowed = new Set(access.writes);
+    const allowed = this.prepareAccess(access).allowedWrites;
     const mutations = update.resources ?? [];
     for (const mutation of mutations) {
       if (!allowed.has(mutation.resource)) {
@@ -822,6 +914,17 @@ export class Simulation {
     this.activeJournal?.resourceChanges.push(
       ...this.resourceRegistry.applyTransaction(mutations),
     );
+    if (this.activeJournal?.resourceProduced && this.activeJournal.resourceConsumed) {
+      for (const mutation of mutations) {
+        if (mutation.amount > 0) {
+          const produced = this.activeJournal.resourceProduced;
+          produced.set(mutation.resource, (produced.get(mutation.resource) ?? 0) + mutation.amount);
+        } else if (mutation.amount < 0) {
+          const consumed = this.activeJournal.resourceConsumed;
+          consumed.set(mutation.resource, (consumed.get(mutation.resource) ?? 0) - mutation.amount);
+        }
+      }
+    }
     if (nextState !== undefined) {
       if (!this.activeJournal?.previousStates.has(access.owner)) {
         const previous = this.systemStates.get(access.owner);
@@ -903,11 +1006,16 @@ export class Simulation {
   private createJournal(): TickJournal {
     return {
       resourceChanges: [],
+      ...(this.resourceProduced === null ? {} : {
+        resourceProduced: new Map<ResourceId, number>(),
+        resourceConsumed: new Map<ResourceId, number>(),
+      }),
       previousStates: new Map(),
       removedCommands: [],
       previousCurrentEvents: this.currentEvents,
       previousPendingEvents: this.pendingEvents,
       previousDurableEvents: this.durableEvents,
+      previousImportantEvents: this.importantEvents,
       previousEmittedEvents: this.emittedEvents,
       nextEventSequence: this.nextEventSequence,
     };
@@ -926,6 +1034,7 @@ export class Simulation {
     this.rebuildEventIndex();
     this.pendingEvents = journal.previousPendingEvents;
     this.durableEvents = journal.previousDurableEvents;
+    this.importantEvents = journal.previousImportantEvents;
     this.emittedEvents = journal.previousEmittedEvents;
     this.nextEventSequence = journal.nextEventSequence;
   }
@@ -953,6 +1062,7 @@ export class Simulation {
             : Math.max(0, nextCommand.issuedAt - this.currentTick - 1);
         const analytical = Math.min(remaining, untilCommand);
         this.currentTick = simTick(this.currentTick + analytical);
+        if (analytical > 0) this.flowDiscontinuities += 1;
         processed += analytical;
         skipped += analytical;
       }
@@ -1109,6 +1219,7 @@ export class Simulation {
         this.nextEventSequence = previousSequence;
         return undefined;
       }
+      this.flowDiscontinuities += 1;
       this.currentEvents = [];
       this.currentEventsByType = new Map();
       this.emittedEvents = [];
@@ -1205,7 +1316,9 @@ export class Simulation {
     if (
       snapshot.schemaVersion !== 2 &&
       snapshot.schemaVersion !== 3 &&
-      snapshot.schemaVersion !== 4
+      snapshot.schemaVersion !== 4 &&
+      snapshot.schemaVersion !== 5 &&
+      snapshot.schemaVersion !== 6
     ) {
       throw new Error(`Unsupported snapshot schema ${snapshot.schemaVersion}`);
     }

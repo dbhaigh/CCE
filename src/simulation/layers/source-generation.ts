@@ -5,14 +5,16 @@ import {
   type SystemContext,
   type SystemUpdate,
 } from "../contracts.js";
-import { Resources } from "../resources.js";
+import { MAX_DEMAND_BACKLOG, Resources } from "../resources.js";
 import { type JsonObject } from "../types.js";
 import {
   ORGANIZATION_LAYER_ID,
   ORGANIZATION_SYSTEM_ID,
+  RESEARCH_SYSTEM_ID,
   SOURCE_GENERATION_SYSTEM_ID,
   SOURCE_LAYER_ID,
 } from "./ids.js";
+import type { ResearchState } from "./knowledge-research.js";
 import {
   parseSourceWorkAllocations,
   payloadField,
@@ -48,6 +50,10 @@ class SourceGenerationSystem
     Resources.AgentCapacity,
     Resources.Compute,
     Resources.Source,
+    Resources.Demand,
+    Resources.Binaries,
+    Resources.Releases,
+    Resources.Reputation,
     Resources.Knowledge,
     Resources.PolicyStrength,
     Resources.CodingStandards,
@@ -59,10 +65,11 @@ class SourceGenerationSystem
     Resources.AgentCapacity,
     Resources.Compute,
     Resources.Source,
+    Resources.Demand,
     Resources.TechnicalDebt,
     Resources.Insight,
   ];
-  public readonly stateReads = [];
+  public readonly stateReads = [RESEARCH_SYSTEM_ID];
   public readonly eventReads = [
     "organization.policy-updated",
     "organization.capacity-allocated",
@@ -83,6 +90,14 @@ class SourceGenerationSystem
     const agentCapacity = view.resources.get(Resources.AgentCapacity);
     const humanPotential = humanCapacity * this.options.humanProductivity;
     const agentPotential = agentCapacity * this.options.agentProductivity;
+    const demand = view.resources.get(Resources.Demand);
+    const organicRequests = Math.min(
+      MAX_DEMAND_BACKLOG - demand,
+      1 + Math.floor(view.resources.get(Resources.Reputation) / 250),
+    );
+    const inFlight = view.resources.get(Resources.Source) +
+      view.resources.get(Resources.Binaries) + view.resources.get(Resources.Releases);
+    const demandLimit = Math.max(0, demand + organicRequests - inFlight);
     const computeLimit = Math.floor(
       view.resources.get(Resources.Compute) / this.options.computePerSource,
     );
@@ -91,10 +106,13 @@ class SourceGenerationSystem
       view.resources.get(Resources.Source);
     const generated = Math.max(
       0,
-      Math.min(humanPotential + agentPotential, computeLimit, bufferLimit),
+      Math.min(humanPotential + agentPotential, computeLimit, bufferLimit, demandLimit),
     );
     if (generated === 0) {
       return {
+        ...(organicRequests > 0 ? {
+          resources: [{ resource: Resources.Demand, amount: organicRequests, reason: "Organic market requests" }],
+        } : {}),
         telemetry: {
           status: "blocked",
           throughput: 0,
@@ -103,7 +121,9 @@ class SourceGenerationSystem
               ? "source-buffer-full"
               : computeLimit <= 0
                 ? "compute"
-                : "authoring-capacity",
+                : demandLimit <= 0
+                  ? "demand-committed"
+                  : "authoring-capacity",
         },
       };
     }
@@ -155,10 +175,13 @@ class SourceGenerationSystem
       risk,
       view.resources.get(Resources.ReleaseCadence),
       context.tick,
+      view.getSystemState<ResearchState>(RESEARCH_SYSTEM_ID)
+        .purchasedUpgrades.includes("verified-ai-source"),
     );
 
     return {
       resources: [
+        { resource: Resources.Demand, amount: organicRequests, reason: "Organic market requests" },
         {
           resource: Resources.HumanCapacity,
           amount: -humansUsed,
@@ -223,6 +246,7 @@ class SourceGenerationSystem
     risk: number,
     cadence: number,
     tick: number,
+    verifiedAi: boolean,
   ): readonly JsonObject[] {
     const artifacts: JsonObject[] = [];
     const availableHuman = allocations.reduce(
@@ -288,7 +312,7 @@ class SourceGenerationSystem
         debtRiskPermille,
         codingStandardsPermille: standards,
         reviewStrengthPermille: reviewStrength,
-        testStrengthPermille: testStrength,
+        testStrengthPermille: verifiedAi ? Math.min(1_000, testStrength + 200) : testStrength,
         riskTolerancePermille: risk,
         releaseCadencePermille: cadence,
         teamId: "agent-swarms",

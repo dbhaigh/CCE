@@ -49,6 +49,7 @@ export const Resources = {
   OperationsSkill: resourceId("core.operations-skill"),
   ResponseCapacity: resourceId("core.response-capacity"),
   ResearchSkill: resourceId("core.research-skill"),
+  Demand: resourceId("core.demand"),
   Source: resourceId("core.source"),
   Binaries: resourceId("core.binaries"),
   Releases: resourceId("core.releases"),
@@ -67,6 +68,8 @@ export const Resources = {
 } as const;
 
 export const MAX_HOT_DEPLOY_REQUESTS = 1_000;
+export const MAX_DEMAND_BACKLOG = 2_000;
+export const INITIAL_DEMAND_BACKLOG = 40;
 
 export const CORE_RESOURCE_DEFINITIONS: readonly ResourceDefinition[] = [
   { id: Resources.Compute, displayName: "Compute", resetEachTick: true },
@@ -131,6 +134,7 @@ export const CORE_RESOURCE_DEFINITIONS: readonly ResourceDefinition[] = [
     displayName: "Research Skill",
     resetEachTick: true,
   },
+  { id: Resources.Demand, displayName: "Unmet Demand", maximum: MAX_DEMAND_BACKLOG },
   { id: Resources.Source, displayName: "Source", maximum: 1_000 },
   { id: Resources.Binaries, displayName: "Binaries", maximum: 500 },
   { id: Resources.Releases, displayName: "Releases", maximum: 100 },
@@ -196,6 +200,8 @@ class FrozenResourceView implements ResourceView {
 export class ResourceRegistry {
   private readonly definitions = new Map<ResourceId, ResourceDefinition>();
   private balances = new Map<ResourceId, number>();
+  private scopedViews = new WeakMap<ReadonlySet<ResourceId>, ResourceView>();
+  private readonly resettable: ResourceId[] = [];
 
   public constructor(
     definitions: readonly ResourceDefinition[],
@@ -213,6 +219,7 @@ export class ResourceRegistry {
       }
       this.definitions.set(definition.id, { ...definition });
       this.balances.set(definition.id, 0);
+      if (definition.resetEachTick) this.resettable.push(definition.id);
     }
 
     for (const [rawId, amount] of Object.entries(initialBalances)) {
@@ -228,22 +235,27 @@ export class ResourceRegistry {
     return this.balances.get(resource) ?? 0;
   }
 
-  public view(allowed?: readonly ResourceId[]): ResourceView {
+  public view(allowed?: readonly ResourceId[] | ReadonlySet<ResourceId>): ResourceView {
     return new FrozenResourceView(
-      this.balances,
-      allowed === undefined ? undefined : new Set(allowed),
+      this.balances, allowed === undefined ? undefined : new Set(allowed),
     );
+  }
+
+  public viewPrepared(allowed: ReadonlySet<ResourceId>): ResourceView {
+    const cached = this.scopedViews.get(allowed);
+    if (cached !== undefined) return cached;
+    const view = new FrozenResourceView(this.balances, new Set(allowed));
+    this.scopedViews.set(allowed, view);
+    return view;
   }
 
   public resetTickResources(): readonly ResourceBalanceChange[] {
     const changes: ResourceBalanceChange[] = [];
-    for (const definition of this.definitions.values()) {
-      if (definition.resetEachTick) {
-        const previous = this.balances.get(definition.id) ?? 0;
-        if (previous !== 0) {
-          changes.push({ resource: definition.id, previous, next: 0 });
-          this.balances.set(definition.id, 0);
-        }
+    for (const resource of this.resettable) {
+      const previous = this.balances.get(resource) ?? 0;
+      if (previous !== 0) {
+        changes.push({ resource, previous, next: 0 });
+        this.balances.set(resource, 0);
       }
     }
     return changes;
@@ -255,11 +267,25 @@ export class ResourceRegistry {
       snapshot,
     );
     this.balances = new Map(replacement.balances);
+    // Prior views retain the old balances, as before restoration.
+    this.scopedViews = new WeakMap();
   }
 
   public applyTransaction(
     mutations: readonly ResourceMutation[],
   ): readonly ResourceBalanceChange[] {
+    if (mutations.length === 0) return [];
+    if (mutations.length === 1) {
+      const mutation = mutations[0];
+      if (mutation === undefined) throw new Error("Missing resource mutation");
+      this.assertDefined(mutation.resource);
+      assertSafeInteger(mutation.amount, `Mutation for ${mutation.resource}`);
+      const previous = this.balances.get(mutation.resource) ?? 0;
+      const next = previous + mutation.amount;
+      this.validateBalance(mutation.resource, next);
+      this.balances.set(mutation.resource, next);
+      return [{ resource: mutation.resource, previous, next }];
+    }
     const nextValues = new Map<ResourceId, number>();
 
     for (const mutation of mutations) {

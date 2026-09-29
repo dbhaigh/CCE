@@ -29,6 +29,16 @@ export type TeamSkillId =
   | "operations"
   | "research";
 
+export type TeamRole = TeamSkillId | "generalist";
+export const TEAM_ROLES: readonly TeamRole[] = [
+  "generalist", "sourceGeneration", "verification", "operations", "research",
+];
+export const TEAM_SKILLS: readonly TeamSkillId[] = [
+  "sourceGeneration", "verification", "operations", "research",
+];
+export const MAX_TEAM_HEADCOUNT = 100;
+export const MAX_SWARM_AGENTS = 100;
+
 export interface TeamCohort extends JsonObject {
   readonly id: string;
   readonly headcount: number;
@@ -36,6 +46,7 @@ export interface TeamCohort extends JsonObject {
   readonly salaryPerTick: number;
   readonly moralePermille: number;
   readonly skillTree: TeamSkillTree;
+  readonly role?: TeamRole;
 }
 
 export interface AgentSwarm extends JsonObject {
@@ -67,6 +78,7 @@ type WeightedPolicyKey =
 
 export interface TeamWorkAllocation extends SourceWorkAllocation {
   readonly policy: OrganizationPolicy;
+  readonly fundedPeople?: number;
 }
 
 export interface SwarmProductivity extends JsonObject {
@@ -105,6 +117,25 @@ export interface TrainTeamPayload extends JsonObject {
   readonly teamId: string;
   readonly skill: TeamSkillId;
   readonly amount: number;
+}
+
+export interface AdjustStaffPayload extends JsonObject {
+  readonly teamId: string;
+  readonly delta: number;
+}
+
+export interface AdjustSwarmPayload extends JsonObject {
+  readonly swarmId: string;
+  readonly delta: number;
+}
+
+export interface AssignTeamRolePayload extends JsonObject {
+  readonly teamId: string;
+  readonly role: TeamRole;
+}
+
+function roleMultiplier(role: TeamRole, skill: TeamSkillId): number {
+  return role === "generalist" ? 1_000 : role === skill ? 1_200 : 750;
 }
 
 export interface OrganizationLayerOptions {
@@ -204,7 +235,7 @@ class OrganizationSystem implements SimulationSystem<OrganizationState> {
       const teamCapacity = Math.floor(
         (affordablePeople *
           cohort.engineeringSkillPermille *
-          cohort.skillTree.sourceGeneration *
+          Math.floor(cohort.skillTree.sourceGeneration * roleMultiplier(cohort.role ?? "generalist", "sourceGeneration") / 1_000) *
           morale) /
           1_000_000_000,
       );
@@ -218,13 +249,14 @@ class OrganizationSystem implements SimulationSystem<OrganizationState> {
         teamId: cohort.id,
         capacity: deliveryCapacity,
         policy: teamPolicy,
+        fundedPeople: affordablePeople,
       });
       moraleTotal += morale * affordablePeople;
       peopleTotal += affordablePeople;
       verificationSkill +=
-        affordablePeople * cohort.skillTree.verification;
-      operationsSkill += affordablePeople * cohort.skillTree.operations;
-      researchSkill += affordablePeople * cohort.skillTree.research;
+        affordablePeople * Math.floor(cohort.skillTree.verification * roleMultiplier(cohort.role ?? "generalist", "verification") / 1_000);
+      operationsSkill += affordablePeople * Math.floor(cohort.skillTree.operations * roleMultiplier(cohort.role ?? "generalist", "operations") / 1_000);
+      researchSkill += affordablePeople * Math.floor(cohort.skillTree.research * roleMultiplier(cohort.role ?? "generalist", "research") / 1_000);
     }
 
     let fundedAgents = 0;
@@ -510,6 +542,37 @@ function createTeamPolicyHandler(): CommandHandler<SetTeamPolicyPayload> {
   };
 }
 
+interface ClearTeamPolicyPayload extends JsonObject {
+  readonly teamId: string;
+}
+
+function createClearTeamPolicyHandler(): CommandHandler<ClearTeamPolicyPayload> {
+  return {
+    id: ORGANIZATION_SYSTEM_ID,
+    type: "organization.clear-team-policy",
+    reads: [], writes: [], stateReads: [], eventReads: [],
+    emits: ["organization.team-policy-cleared"],
+    handle: (command, view) => {
+      const state = view.getSystemState<OrganizationState>(ORGANIZATION_SYSTEM_ID);
+      if (!state.teams.some((team) => team.id === command.payload.teamId)) {
+        throw new Error(`Unknown team: ${command.payload.teamId}`);
+      }
+      if (!(command.payload.teamId in state.teamPolicies)) {
+        throw new Error(`Team ${command.payload.teamId} already inherits global policy`);
+      }
+      const teamPolicies = { ...state.teamPolicies };
+      delete teamPolicies[command.payload.teamId];
+      return {
+        statePatch: { teamPolicies },
+        events: [{
+          type: "organization.team-policy-cleared",
+          payload: { teamId: command.payload.teamId },
+        }],
+      };
+    },
+  };
+}
+
 function createSwarmHandler(): CommandHandler<ConfigureSwarmPayload> {
   return {
     id: ORGANIZATION_SYSTEM_ID,
@@ -573,11 +636,12 @@ function createTrainingHandler(): CommandHandler<TrainTeamPayload> {
     eventReads: [],
     emits: ["organization.team-trained"],
     handle: (command, view) => {
-      if (
-        !Number.isSafeInteger(command.payload.amount) ||
-        command.payload.amount <= 0
-      ) {
-        throw new Error("Training amount must be a positive integer");
+      if (!Number.isSafeInteger(command.payload.amount) ||
+        command.payload.amount < 1 || command.payload.amount > 100) {
+        throw new Error("Training amount must be an integer from 1 to 100");
+      }
+      if (!TEAM_SKILLS.includes(command.payload.skill)) {
+        throw new Error(`Unknown team skill: ${command.payload.skill}`);
       }
       const state = view.getSystemState<OrganizationState>(
         ORGANIZATION_SYSTEM_ID,
@@ -588,16 +652,16 @@ function createTrainingHandler(): CommandHandler<TrainTeamPayload> {
       if (team === undefined) {
         throw new Error(`Unknown team: ${command.payload.teamId}`);
       }
+      if (team.skillTree[command.payload.skill] + command.payload.amount > 2_000) {
+        throw new Error(`Training would exceed the skill cap of 2000 for ${command.payload.skill}`);
+      }
       const cost = command.payload.amount * 5;
       if (!view.resources.has(Resources.Money, cost)) {
         throw new Error("Insufficient Money for training");
       }
       const skillTree = {
         ...team.skillTree,
-        [command.payload.skill]: Math.min(
-          2_000,
-          team.skillTree[command.payload.skill] + command.payload.amount,
-        ),
+        [command.payload.skill]: team.skillTree[command.payload.skill] + command.payload.amount,
       };
       return {
         resources: [
@@ -638,6 +702,103 @@ function createTrainingHandler(): CommandHandler<TrainTeamPayload> {
   };
 }
 
+function validateAdjustment(delta: number): void {
+  if (!Number.isSafeInteger(delta) || delta === 0 || Math.abs(delta) > 10) {
+    throw new Error("Staff change must be an integer between -10 and 10, excluding zero");
+  }
+}
+
+function createStaffHandler(): CommandHandler<AdjustStaffPayload> {
+  return {
+    id: ORGANIZATION_SYSTEM_ID,
+    type: "organization.adjust-team",
+    reads: [Resources.Money],
+    writes: [Resources.Money],
+    stateReads: [],
+    eventReads: [],
+    emits: ["organization.team-staffed"],
+    handle: (command, view) => {
+      const { teamId, delta } = command.payload;
+      validateAdjustment(delta);
+      const state = view.getSystemState<OrganizationState>(ORGANIZATION_SYSTEM_ID);
+      const team = state.teams.find((item) => item.id === teamId);
+      if (!team) throw new Error(`Unknown team: ${teamId}`);
+      const headcount = team.headcount + delta;
+      if (headcount < 0 || headcount > MAX_TEAM_HEADCOUNT) {
+        throw new Error(`Team headcount must be between 0 and ${MAX_TEAM_HEADCOUNT}`);
+      }
+      const cost = Math.max(0, delta) * team.salaryPerTick * 5;
+      if (!view.resources.has(Resources.Money, cost)) throw new Error("Insufficient Money to hire engineers");
+      return {
+        resources: cost ? [{ resource: Resources.Money, amount: -cost, reason: "Engineer onboarding" }] : [],
+        state: {
+          ...state,
+          teams: state.teams.map((item) => item.id === teamId ? { ...item, headcount } : item),
+        },
+        events: [{ type: "organization.team-staffed", payload: { teamId, delta, headcount } }],
+      };
+    },
+  };
+}
+
+function createSwarmStaffHandler(): CommandHandler<AdjustSwarmPayload> {
+  return {
+    id: ORGANIZATION_SYSTEM_ID,
+    type: "organization.adjust-swarm",
+    reads: [Resources.Money],
+    writes: [Resources.Money],
+    stateReads: [],
+    eventReads: [],
+    emits: ["organization.swarm-staffed"],
+    handle: (command, view) => {
+      const { swarmId, delta } = command.payload;
+      validateAdjustment(delta);
+      const state = view.getSystemState<OrganizationState>(ORGANIZATION_SYSTEM_ID);
+      const swarm = state.agentSwarms.find((item) => item.id === swarmId);
+      if (!swarm) throw new Error(`Unknown swarm: ${swarmId}`);
+      const agents = swarm.agents + delta;
+      if (agents < 0 || agents > MAX_SWARM_AGENTS) {
+        throw new Error(`Swarm agents must be between 0 and ${MAX_SWARM_AGENTS}`);
+      }
+      const cost = Math.max(0, delta) * swarm.operatingCostPerAgent * 5;
+      if (!view.resources.has(Resources.Money, cost)) throw new Error("Insufficient Money to recruit agents");
+      return {
+        resources: cost ? [{ resource: Resources.Money, amount: -cost, reason: "Agent onboarding" }] : [],
+        state: {
+          ...state,
+          agentSwarms: state.agentSwarms.map((item) => item.id === swarmId ? { ...item, agents } : item),
+        },
+        events: [{ type: "organization.swarm-staffed", payload: { swarmId, delta, agents } }],
+      };
+    },
+  };
+}
+
+function createRoleHandler(): CommandHandler<AssignTeamRolePayload> {
+  return {
+    id: ORGANIZATION_SYSTEM_ID,
+    type: "organization.assign-team-role",
+    reads: [],
+    writes: [],
+    stateReads: [],
+    eventReads: [],
+    emits: ["organization.team-role-assigned"],
+    handle: (command, view) => {
+      const { teamId, role } = command.payload;
+      if (!TEAM_ROLES.includes(role)) throw new Error(`Unknown team role: ${role}`);
+      const state = view.getSystemState<OrganizationState>(ORGANIZATION_SYSTEM_ID);
+      if (!state.teams.some((team) => team.id === teamId)) throw new Error(`Unknown team: ${teamId}`);
+      return {
+        state: {
+          ...state,
+          teams: state.teams.map((team) => team.id === teamId ? { ...team, role } : team),
+        },
+        events: [{ type: "organization.team-role-assigned", payload: { teamId, role } }],
+      };
+    },
+  };
+}
+
 export function createOrganizationLayer(
   options: OrganizationLayerOptions,
 ): SimulationLayer {
@@ -673,8 +834,12 @@ export function createOrganizationLayer(
     commandHandlers: [
       createPolicyHandler(),
       createTeamPolicyHandler(),
+      createClearTeamPolicyHandler(),
       createSwarmHandler(),
       createTrainingHandler(),
+      createStaffHandler(),
+      createSwarmStaffHandler(),
+      createRoleHandler(),
     ],
     eventHandlers: [],
     feedbackLoops: [

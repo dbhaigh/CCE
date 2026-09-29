@@ -5,10 +5,14 @@ import {
 } from "./simulation.js";
 import { cloneJson } from "./types.js";
 import { contentHash } from "./content.js";
+import { INITIAL_DEMAND_BACKLOG, MAX_DEMAND_BACKLOG, Resources } from "./resources.js";
+import { COMPILATION_SYSTEM_ID, ORGANIZATION_SYSTEM_ID, RESEARCH_SYSTEM_ID,
+  SOURCE_GENERATION_SYSTEM_ID } from "./layers/ids.js";
+import { RESEARCH_UPGRADES } from "./layers/knowledge-research.js";
+import { SAVE_FORMAT, SAVE_FORMAT_VERSION } from "./save-format.js";
 
-export const SAVE_FORMAT = "code-compiler-empire";
-export const SAVE_FORMAT_VERSION = 1;
-export const CURRENT_SNAPSHOT_VERSION = 4;
+export { SAVE_FORMAT, SAVE_FORMAT_VERSION } from "./save-format.js";
+export const CURRENT_SNAPSHOT_VERSION = 6;
 
 export interface SaveEnvelope {
   readonly format: typeof SAVE_FORMAT;
@@ -43,6 +47,39 @@ const migrations = new Map<number, SnapshotMigration>([
     3,
     (snapshot) => migrateArtifactPolicy(snapshot),
   ],
+  [
+    4,
+    (snapshot) => ({ ...snapshot, schemaVersion: 5, importantEvents: [] }),
+  ],
+  [
+    5,
+    (snapshot) => {
+      const resources = isRecord(snapshot.resources) ? snapshot.resources : {};
+      const states = isRecord(snapshot.systemStates) ? snapshot.systemStates : {};
+      const researchValue = states[RESEARCH_SYSTEM_ID];
+      const buildValue = states[COMPILATION_SYSTEM_ID];
+      const research = isRecord(researchValue) ? researchValue : {};
+      const build = isRecord(buildValue) ? buildValue : {};
+      const inFlight = [Resources.Source, Resources.Binaries, Resources.Releases].reduce(
+        (total, id) => total + (typeof resources[id] === "number" ? resources[id] : 0), 0);
+      return {
+        ...snapshot,
+        schemaVersion: 6,
+        resources: { ...resources, [Resources.Demand]: resources[Resources.Demand] ??
+          Math.min(MAX_DEMAND_BACKLOG, Math.max(INITIAL_DEMAND_BACKLOG, inFlight)) },
+        systemStates: {
+          ...states,
+          [RESEARCH_SYSTEM_ID]: { ...research, purchasedUpgrades: research.purchasedUpgrades ?? [] },
+          [COMPILATION_SYSTEM_ID]: {
+            ...build,
+            jobs: Array.isArray(build.jobs)
+              ? build.jobs.map((job) => isRecord(job) ? { ...job, sourceTeamId: job.sourceTeamId ?? null } : job)
+              : build.jobs ?? [],
+          },
+        },
+      };
+    },
+  ],
 ]);
 
 export function encodeSave(
@@ -63,6 +100,13 @@ export function decodeSave(
   configuration: SimulationConfiguration,
   serialized: string,
 ): Simulation {
+  return decodeSaveWithMetadata(configuration, serialized).simulation;
+}
+
+export function decodeSaveWithMetadata(
+  configuration: SimulationConfiguration,
+  serialized: string,
+): { readonly simulation: Simulation; readonly wallClockSavedAt: number } {
   let parsed: unknown;
   try {
     parsed = JSON.parse(serialized);
@@ -76,7 +120,15 @@ export function decodeSave(
 
   const snapshotInput = extractSnapshot(parsed);
   const snapshot = migrateSnapshot(snapshotInput);
-  return Simulation.restore(configuration, snapshot);
+  const compatibleSnapshot = configuration.gameVersion === "0.0.1" &&
+    snapshot.gameVersion === "0.1.0" &&
+    snapshot.contentHash === configuration.contentHash
+    ? { ...snapshot, gameVersion: configuration.gameVersion }
+    : snapshot;
+  return {
+    simulation: Simulation.restore(configuration, compatibleSnapshot),
+    wallClockSavedAt: compatibleSnapshot.wallClockSavedAt,
+  };
 }
 
 export function migrateSnapshot(input: unknown): SimulationSnapshot {
@@ -167,6 +219,9 @@ function validateCurrentSnapshot(snapshot: UnknownRecord): void {
     if (!Array.isArray(snapshot[field])) {
       throw new Error(`Snapshot ${field} must be an array`);
     }
+    if (!Array.isArray(snapshot.importantEvents) || snapshot.importantEvents.length > 64) {
+      throw new Error("Snapshot importantEvents must contain at most 64 events");
+    }
   }
   for (const command of snapshot.queuedCommands as unknown[]) {
     if (
@@ -179,9 +234,35 @@ function validateCurrentSnapshot(snapshot: UnknownRecord): void {
       throw new Error("Snapshot contains an invalid command");
     }
   }
+  const states = snapshot.systemStates as UnknownRecord;
+  if (states[SOURCE_GENERATION_SYSTEM_ID] !== undefined) {
+    const demand = (snapshot.resources as UnknownRecord)[Resources.Demand];
+    if (typeof demand !== "number" || !Number.isSafeInteger(demand) ||
+      demand < 0 || demand > MAX_DEMAND_BACKLOG) {
+      throw new Error("Snapshot market demand is missing or invalid");
+    }
+  }
+  const research = states[RESEARCH_SYSTEM_ID];
+  if (isRecord(research) && (!Array.isArray(research.purchasedUpgrades) ||
+    research.purchasedUpgrades.some((id) => typeof id !== "string" ||
+      !RESEARCH_UPGRADES.some((upgrade) => upgrade.id === id &&
+        Array.isArray(research.completed) && research.completed.includes(upgrade.projectId))) ||
+    new Set(research.purchasedUpgrades).size !== research.purchasedUpgrades.length)) {
+    throw new Error("Snapshot research upgrades are invalid");
+  }
+  const organization = states[ORGANIZATION_SYSTEM_ID];
+  const teamIds = isRecord(organization) && Array.isArray(organization.teams)
+    ? organization.teams.filter(isRecord).map((team) => team.id) : [];
+  const build = states[COMPILATION_SYSTEM_ID];
+  if (isRecord(build) && Array.isArray(build.jobs) && build.jobs.some(
+    (job) => !isRecord(job) || (job.sourceTeamId !== null &&
+      (typeof job.sourceTeamId !== "string" || !teamIds.includes(job.sourceTeamId))))) {
+    throw new Error("Snapshot build job source team is invalid");
+  }
   for (const event of [
     ...(snapshot.pendingEvents as unknown[]),
     ...(snapshot.durableEvents as unknown[]),
+    ...(snapshot.importantEvents as unknown[]),
   ]) {
     if (
       !isRecord(event) ||
@@ -191,9 +272,17 @@ function validateCurrentSnapshot(snapshot: UnknownRecord): void {
       !Number.isSafeInteger(event.sequence) ||
       typeof event.tick !== "number" ||
       !Number.isSafeInteger(event.tick) ||
-      !["nextTick", "durable"].includes(String(event.delivery))
+      !["sameTick", "nextTick", "durable"].includes(String(event.delivery))
     ) {
       throw new Error("Snapshot contains an invalid queued event");
+    }
+    for (const event of [
+      ...(snapshot.pendingEvents as unknown[]),
+      ...(snapshot.durableEvents as unknown[]),
+    ]) {
+      if (isRecord(event) && event.delivery === "sameTick") {
+        throw new Error("Queued save events cannot have same-tick delivery");
+      }
     }
   }
 }
