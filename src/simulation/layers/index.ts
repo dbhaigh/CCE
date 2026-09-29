@@ -34,6 +34,8 @@ import {
 import type { SimulationConfiguration } from "../simulation.js";
 import {
   CORE_RESOURCE_DEFINITIONS,
+  INITIAL_DEMAND_BACKLOG,
+  Resources,
   type ResourceDefinition,
   type ResourceSnapshot,
 } from "../resources.js";
@@ -86,6 +88,7 @@ export function createCoreSimulationConfiguration(
     ...options,
     contentHash: modules.contentHash ?? coreBalanceContentHash(balance),
     resources: options.resources ?? CORE_RESOURCE_DEFINITIONS,
+    initialResources: { [Resources.Demand]: INITIAL_DEMAND_BACKLOG, ...options.initialResources },
     systems: modules.systems,
     pipelines: modules.pipelines,
     commandHandlers: modules.commandHandlers,

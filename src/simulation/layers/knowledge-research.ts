@@ -32,7 +32,15 @@ export interface ResearchState extends JsonObject {
   readonly selectedProjectId: string | null;
   readonly progress: Readonly<Record<string, number>>;
   readonly completed: readonly string[];
+  readonly purchasedUpgrades: readonly string[];
 }
+
+export const RESEARCH_UPGRADES = [
+  { id: "incremental-build-cache", projectId: "incremental-builds",
+    moneyCost: 80, knowledgeCost: 10, description: "Save 1 Compute per compiled Source (minimum 1)." },
+  { id: "verified-ai-source", projectId: "verified-generation",
+    moneyCost: 160, knowledgeCost: 20, description: "Add 200/1,000 test strength to new AI-authored Source (maximum 1,000)." },
+] as const;
 
 export interface KnowledgeLayerOptions {
   readonly projects: readonly ResearchProject[];
@@ -83,6 +91,7 @@ class ResearchSystem implements SimulationSystem<ResearchState> {
       selectedProjectId: this.options.initialProjectId,
       progress: {},
       completed: [],
+      purchasedUpgrades: [],
     };
   }
 
@@ -173,6 +182,41 @@ class ResearchSystem implements SimulationSystem<ResearchState> {
   }
 }
 
+function createPurchaseUpgradeHandler(): CommandHandler<{ readonly upgradeId: string } & JsonObject> {
+  return {
+    id: RESEARCH_SYSTEM_ID,
+    type: "research.purchase-upgrade",
+    reads: [Resources.Money, Resources.Knowledge],
+    writes: [Resources.Money, Resources.Knowledge],
+    stateReads: [],
+    eventReads: [],
+    emits: ["research.upgrade-purchased"],
+    handle: (command, view) => {
+      const upgrade = RESEARCH_UPGRADES.find((item) => item.id === command.payload.upgradeId);
+      if (!upgrade) throw new Error(`Unknown research upgrade: ${command.payload.upgradeId}`);
+      const state = view.getSystemState<ResearchState>(RESEARCH_SYSTEM_ID);
+      if (!state.completed.includes(upgrade.projectId)) {
+        throw new Error(`Complete ${upgrade.projectId} before purchasing ${upgrade.id}`);
+      }
+      if (state.purchasedUpgrades.includes(upgrade.id)) {
+        throw new Error(`Upgrade already purchased: ${upgrade.id}`);
+      }
+      if (!view.resources.has(Resources.Money, upgrade.moneyCost) ||
+        !view.resources.has(Resources.Knowledge, upgrade.knowledgeCost)) {
+        throw new Error(`Insufficient Money or Knowledge for ${upgrade.id}`);
+      }
+      return {
+        resources: [
+          { resource: Resources.Money, amount: -upgrade.moneyCost, reason: `Upgrade ${upgrade.id}` },
+          { resource: Resources.Knowledge, amount: -upgrade.knowledgeCost, reason: `Upgrade ${upgrade.id}` },
+        ],
+        statePatch: { purchasedUpgrades: [...state.purchasedUpgrades, upgrade.id] },
+        events: [{ type: "research.upgrade-purchased", payload: { upgradeId: upgrade.id } }],
+      };
+    },
+  };
+}
+
 function createResearchHandler(): CommandHandler<SelectResearchPayload> {
   return {
     id: RESEARCH_SYSTEM_ID,
@@ -228,7 +272,7 @@ export function createKnowledgeResearchLayer(
       outputs: [Resources.Knowledge],
     },
     systems: [new ResearchSystem(options)],
-    commandHandlers: [createResearchHandler()],
+    commandHandlers: [createResearchHandler(), createPurchaseUpgradeHandler()],
     eventHandlers: [],
     feedbackLoops: [
       "Build, test, and runtime evidence becomes knowledge that improves AI productivity and build caching on later ticks.",

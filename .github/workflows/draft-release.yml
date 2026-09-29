@@ -1,0 +1,134 @@
+name: Draft release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag on main to build and attach to a draft release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: draft-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: Verify existing tag on main
+    runs-on: ubuntu-22.04
+    # GitHub hides existing draft releases from tokens without write access.
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.verify.outputs.tag }}
+      commit: ${{ steps.verify.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify remote tag, main ancestry, and release absence
+        id: verify
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == "refs/heads/main" ]] || {
+            echo "Run this workflow from main, not from another branch." >&2
+            exit 1
+          }
+          [[ "$TAG" == "v0.0.1" ]] || {
+            echo "This release workflow is configured for v0.0.1 only." >&2
+            exit 1
+          }
+          git check-ref-format "refs/tags/$TAG"
+          if ! git ls-remote --exit-code --refs origin "refs/tags/$TAG" >/dev/null; then
+            echo "The tag does not exist on origin." >&2
+            exit 1
+          fi
+          git fetch --no-tags --force origin \
+            "+refs/heads/main:refs/remotes/origin/main" \
+            "+refs/tags/$TAG:refs/tags/$TAG"
+          commit="$(git rev-parse --verify "refs/tags/$TAG^{commit}")"
+          if ! git merge-base --is-ancestor "$commit" refs/remotes/origin/main; then
+            echo "The tagged commit is not on main." >&2
+            exit 1
+          fi
+          if response="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" 2>&1)"; then
+            echo "A release already exists for this tag; refusing to replace it." >&2
+            exit 1
+          elif [[ "$response" != *"HTTP 404"* ]]; then
+            echo "$response" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Rebuild and test tagged commit
+    needs: guard
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.guard.outputs.commit }}
+    permissions:
+      contents: read
+
+  draft:
+    name: Assemble draft release
+    needs: [guard, build]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.guard.outputs.commit }}
+          fetch-depth: 0
+      - name: Download platform artifacts from this run
+        uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-*
+          path: release-assets
+      - name: Revalidate tag and create draft
+        shell: bash
+        env:
+          TAG: ${{ needs.guard.outputs.tag }}
+          EXPECTED_COMMIT: ${{ needs.guard.outputs.commit }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --force origin "+refs/tags/$TAG:refs/tags/$TAG"
+          [[ "$(git rev-parse --verify "refs/tags/$TAG^{commit}")" == "$EXPECTED_COMMIT" ]] || {
+            echo "The tag moved during the build; refusing to create a release." >&2
+            exit 1
+          }
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+          git merge-base --is-ancestor "$EXPECTED_COMMIT" refs/remotes/origin/main || {
+            echo "The tagged commit is no longer on main." >&2
+            exit 1
+          }
+          if response="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" 2>&1)"; then
+            echo "A release already exists for this tag; refusing to replace it." >&2
+            exit 1
+          elif [[ "$response" != *"HTTP 404"* ]]; then
+            echo "$response" >&2
+            exit 1
+          fi
+          mapfile -d '' -t assets < <(find release-assets -type f -print0)
+          [[ ${#assets[@]} -eq 6 ]] || {
+            echo "Expected the executable/installer, app/DMG, and deb/AppImage (six files); found ${#assets[@]}." >&2
+            exit 1
+          }
+          [[ -s RELEASE_NOTES_0.0.1.md ]] || {
+            echo "RELEASE_NOTES_0.0.1.md must exist at the tagged commit and be nonempty." >&2
+            exit 1
+          }
+          gh release create "$TAG" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft --verify-tag \
+            --title "Code Compiler Empire $TAG" \
+            --notes-file RELEASE_NOTES_0.0.1.md

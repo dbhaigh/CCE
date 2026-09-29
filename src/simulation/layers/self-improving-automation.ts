@@ -52,6 +52,9 @@ class AutomationSystem implements SimulationSystem<AutomationState> {
     Resources.AgentAutonomy,
     Resources.Morale,
     Resources.Source,
+    Resources.Binaries,
+    Resources.Releases,
+    Resources.Demand,
     Resources.AgentInstability,
   ];
   public readonly writes = [
@@ -124,10 +127,16 @@ class AutomationSystem implements SimulationSystem<AutomationState> {
     const sourceCapacity =
       this.options.sourceBufferCapacity -
       view.resources.get(Resources.Source);
+    const uncommittedDemand = Math.max(0,
+      view.resources.get(Resources.Demand) -
+      view.resources.get(Resources.Source) -
+      view.resources.get(Resources.Binaries) -
+      view.resources.get(Resources.Releases));
     const generated = Math.max(
       0,
       Math.min(
         sourceCapacity,
+        uncommittedDemand,
         Math.floor(
           (effectivePower * (500 + risk + autonomy)) / 20_000,
         ),

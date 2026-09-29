@@ -27,7 +27,10 @@ import {
   ORGANIZATION_SYSTEM_ID,
   SOURCE_GENERATION_SYSTEM_ID,
   SOURCE_LAYER_ID,
+  RESEARCH_SYSTEM_ID,
 } from "./ids.js";
+import type { ResearchState } from "./knowledge-research.js";
+import type { OrganizationState } from "./organization.js";
 
 export {
   BUILD_LAYER_ID,
@@ -62,6 +65,44 @@ export interface BuildState extends JsonObject {
   readonly stageExecutions: Readonly<Record<string, number>>;
   readonly sourceCohorts: readonly SourceArtifactCohort[];
   readonly binaryCohortsCreated: number;
+  readonly jobs?: readonly BuildJob[];
+  readonly nextJobId?: number;
+  readonly lastRun?: BuildRun;
+}
+
+export interface BuildJob extends JsonObject {
+  readonly id: string;
+  readonly requested: number;
+  readonly remaining: number;
+  readonly createdTick: number;
+  readonly sourceTeamId: string | null;
+  readonly succeededUnits?: number;
+  readonly failedUnits?: number;
+}
+
+export interface BuildRun extends JsonObject {
+  readonly tick: number;
+  readonly manualSource: number;
+  readonly automaticSource: number;
+  readonly computePerSource: number;
+  readonly failed: boolean;
+}
+
+export const MAX_BUILD_JOBS = 16;
+export const MAX_BUILD_UNITS_PER_JOB = 256;
+export const MAX_QUEUED_BUILD_UNITS = 1_000;
+
+export interface StartBuildJobPayload extends JsonObject {
+  readonly quantity: number;
+  readonly sourceTeamId?: string | null;
+}
+
+export interface BuildJobIdPayload extends JsonObject {
+  readonly jobId: string;
+}
+
+export interface ReorderBuildJobPayload extends BuildJobIdPayload {
+  readonly direction: number;
 }
 
 export interface BuildLayerOptions {
@@ -181,7 +222,7 @@ class BuildSystem implements SimulationSystem<BuildState> {
     Resources.Insight,
     Resources.TechnicalDebt,
   ];
-  public readonly stateReads = [];
+  public readonly stateReads = [RESEARCH_SYSTEM_ID];
   public readonly eventReads = [
     "source.batch-generated",
     "automation.source-generated",
@@ -190,6 +231,7 @@ class BuildSystem implements SimulationSystem<BuildState> {
     "build.completed",
     "build.failed",
     "build.cache-updated",
+    "build.job-completed",
   ];
 
   private readonly stageOrder: readonly BuildStageDefinition[];
@@ -208,6 +250,8 @@ class BuildSystem implements SimulationSystem<BuildState> {
       ),
       sourceCohorts: [],
       binaryCohortsCreated: 0,
+      jobs: [],
+      nextJobId: 1,
     };
   }
 
@@ -234,10 +278,16 @@ class BuildSystem implements SimulationSystem<BuildState> {
         sourceCohorts = appendBoundedCohort(
           sourceCohorts,
           artifact,
-          256,
+          1_000,
           (left, right) =>
+            left.teamId === right.teamId &&
             left.humanPermille === right.humanPermille &&
-            left.debtRiskPermille === right.debtRiskPermille,
+            left.debtRiskPermille === right.debtRiskPermille &&
+            left.codingStandardsPermille === right.codingStandardsPermille &&
+            left.reviewStrengthPermille === right.reviewStrengthPermille &&
+            left.testStrengthPermille === right.testStrengthPermille &&
+            left.riskTolerancePermille === right.riskTolerancePermille &&
+            left.releaseCadencePermille === right.releaseCadencePermille,
           (left, right) => ({
             ...left,
             quantity: left.quantity + right.quantity,
@@ -327,7 +377,9 @@ class BuildSystem implements SimulationSystem<BuildState> {
     const cacheSavings = Math.floor(
       (cacheableCompute * state.cacheWarmthPermille) / 1_000,
     );
-    const computePerSource = Math.max(1, rawComputePerSource - cacheSavings);
+    const cacheUpgrade = view.getSystemState<ResearchState>(RESEARCH_SYSTEM_ID)
+      .purchasedUpgrades.includes("incremental-build-cache") ? 1 : 0;
+    const computePerSource = Math.max(1, rawComputePerSource - cacheSavings - cacheUpgrade);
     const availableBinaryBuffer = Math.floor(
       (this.options.binaryBufferCapacity -
         view.resources.get(Resources.Binaries)) /
@@ -359,7 +411,38 @@ class BuildSystem implements SimulationSystem<BuildState> {
         },
       };
     }
-    const sourcePolicy = this.averageSourcePolicy(sourceCohorts, consumed);
+    const remainingByCohort = sourceCohorts.map((cohort) => cohort.quantity);
+    const selectedSource: SourceArtifactCohort[] = [];
+    const allocations: number[] = [];
+    let availableCapacity = consumed;
+    const select = (limit: number, teamId: string | null): number => {
+      let selected = 0;
+      for (let index = 0; index < sourceCohorts.length && selected < limit; index += 1) {
+        const cohort = sourceCohorts[index];
+        const available = remainingByCohort[index] ?? 0;
+        if (!cohort || available === 0 || (teamId !== null && cohort.teamId !== teamId)) continue;
+        const quantity = Math.min(limit - selected, available);
+        remainingByCohort[index] = available - quantity;
+        selectedSource.push({ ...cohort, quantity });
+        selected += quantity;
+      }
+      return selected;
+    };
+    for (const job of state.jobs ?? []) {
+      const allocated = select(Math.min(availableCapacity, job.remaining), job.sourceTeamId ?? null);
+      allocations.push(allocated);
+      availableCapacity -= allocated;
+    }
+    const automaticSource = select(availableCapacity, null);
+    const manualSource = consumed - automaticSource;
+    if (manualSource + automaticSource !== consumed) {
+      throw new Error("Build selection did not conserve available Source");
+    }
+    const remainingSourceCohorts = sourceCohorts.flatMap((cohort, index) => {
+      const quantity = remainingByCohort[index] ?? 0;
+      return quantity === 0 ? [] : [{ ...cohort, quantity }];
+    });
+    const sourcePolicy = this.averageSourcePolicy(selectedSource, consumed);
     const localGovernance = Math.floor(
       (sourcePolicy.reviewStrengthPermille +
         sourcePolicy.testStrengthPermille) /
@@ -382,6 +465,19 @@ class BuildSystem implements SimulationSystem<BuildState> {
       ),
     );
     const failed = context.random.chance("build-failure", failureRate);
+    const jobs: BuildJob[] = [];
+    const completedJobs: BuildJob[] = [];
+    for (const [index, job] of (state.jobs ?? []).entries()) {
+      const allocated = allocations[index] ?? 0;
+      const updated = allocated === 0 ? job : {
+        ...job,
+        remaining: job.remaining - allocated,
+        succeededUnits: (job.succeededUnits ?? 0) + (failed ? 0 : allocated),
+        failedUnits: (job.failedUnits ?? 0) + (failed ? allocated : 0),
+      };
+      if (updated.remaining === 0) completedJobs.push(updated);
+      else jobs.push(updated);
+    }
     const binaries = failed ? 0 : consumed * this.options.binariesPerSource;
     const bugRate = Math.max(
       0,
@@ -418,10 +514,6 @@ class BuildSystem implements SimulationSystem<BuildState> {
         stage.id,
         (state.stageExecutions[stage.id] ?? 0) + consumed,
       ]),
-    );
-    const remainingSourceCohorts = this.consumeSourceCohorts(
-      sourceCohorts,
-      consumed,
     );
     const artifact: BinaryArtifactCohort | undefined =
       binaries === 0
@@ -480,6 +572,10 @@ class BuildSystem implements SimulationSystem<BuildState> {
         sourceCohorts: remainingSourceCohorts,
         binaryCohortsCreated:
           state.binaryCohortsCreated + (artifact === undefined ? 0 : 1),
+        jobs,
+        lastRun: {
+          tick: context.tick, manualSource, automaticSource, computePerSource, failed,
+        },
       },
       events: [
         {
@@ -498,25 +594,16 @@ class BuildSystem implements SimulationSystem<BuildState> {
           type: "build.cache-updated",
           payload: { warmthPermille: cacheWarmth },
         },
+        ...completedJobs.map((job) => ({
+          type: "build.job-completed",
+          payload: {
+            jobId: job.id, requested: job.requested,
+            succeededUnits: job.succeededUnits ?? 0, failedUnits: job.failedUnits ?? 0,
+          },
+        })),
       ],
       telemetry: { status: "active", throughput: binaries },
     };
-  }
-
-  private consumeSourceCohorts(
-    cohorts: readonly SourceArtifactCohort[],
-    quantity: number,
-  ): readonly SourceArtifactCohort[] {
-    let remaining = quantity;
-    const result: SourceArtifactCohort[] = [];
-    for (const cohort of cohorts) {
-      const consumed = Math.min(remaining, cohort.quantity);
-      remaining -= consumed;
-      if (cohort.quantity > consumed) {
-        result.push({ ...cohort, quantity: cohort.quantity - consumed });
-      }
-    }
-    return result;
   }
 
   private averageSourcePolicy(
@@ -618,6 +705,91 @@ function createHardwareHandler(): CommandHandler<SelectHardwarePayload> {
   };
 }
 
+function buildJobHandler<P extends JsonObject>(
+  type: string,
+  emits: string,
+  update: (payload: P, state: BuildState, tick: number, view: SimulationView) => {
+    readonly jobs: readonly BuildJob[];
+    readonly nextJobId?: number;
+    readonly details: JsonObject;
+  },
+): CommandHandler<P> {
+  return {
+    id: COMPILATION_SYSTEM_ID, type, reads: [], writes: [], stateReads: [ORGANIZATION_SYSTEM_ID],
+    eventReads: [], emits: [emits],
+    handle: (command, view) => {
+      const state = view.getSystemState<BuildState>(COMPILATION_SYSTEM_ID);
+      const result = update(command.payload, state, view.tick, view);
+      return {
+        statePatch: {
+          jobs: result.jobs,
+          ...(result.nextJobId === undefined ? {} : { nextJobId: result.nextJobId }),
+        },
+        events: [{ type: emits, payload: result.details }],
+      };
+    },
+  };
+}
+
+const startJob = buildJobHandler<StartBuildJobPayload>(
+  "build.start-job", "build.job-queued", (payload, state, tick, view) => {
+    const quantity = payload.quantity;
+    if (!Number.isSafeInteger(quantity) || quantity < 1 || quantity > MAX_BUILD_UNITS_PER_JOB) {
+      throw new Error(`Build job quantity must be between 1 and ${MAX_BUILD_UNITS_PER_JOB}`);
+    }
+    const jobs = state.jobs ?? [];
+    if (jobs.length >= MAX_BUILD_JOBS ||
+      jobs.reduce((sum, job) => sum + job.remaining, 0) + quantity > MAX_QUEUED_BUILD_UNITS) {
+      throw new Error(`Build queue is full (max ${MAX_BUILD_JOBS} jobs, ${MAX_QUEUED_BUILD_UNITS} source units)`);
+    }
+    const sourceTeamId = payload.sourceTeamId ?? null;
+    if (sourceTeamId !== null &&
+      !view.getSystemState<OrganizationState>(ORGANIZATION_SYSTEM_ID)
+        .teams.some((team) => team.id === sourceTeamId)) {
+      throw new Error(`Unknown source-producing team: ${sourceTeamId}`);
+    }
+    const nextJobId = state.nextJobId ?? 1;
+    if (!Number.isSafeInteger(nextJobId) || nextJobId < 1) throw new Error("Invalid build job sequence");
+    const job = { id: `job:${nextJobId}`, requested: quantity, remaining: quantity, createdTick: tick, sourceTeamId };
+    return { jobs: [...jobs, job], nextJobId: nextJobId + 1,
+      details: { jobId: job.id, quantity, sourceTeamId } };
+  },
+);
+
+const cancelJob = buildJobHandler<BuildJobIdPayload>(
+  "build.cancel-job", "build.job-cancelled", (payload, state) => {
+    const jobs = state.jobs ?? [];
+    const job = jobs.find((entry) => entry.id === payload.jobId);
+    if (!job) throw new Error(`Unknown queued build job: ${payload.jobId}`);
+    return { jobs: jobs.filter((entry) => entry.id !== job.id),
+      details: { jobId: job.id, unbuilt: job.remaining } };
+  },
+);
+
+function moveJob(payload: BuildJobIdPayload, state: BuildState, direction?: number) {
+  const jobs = [...(state.jobs ?? [])];
+  const index = jobs.findIndex((job) => job.id === payload.jobId);
+  if (index < 0) throw new Error(`Unknown queued build job: ${payload.jobId}`);
+  const destination = direction === undefined ? 0 : index + direction;
+  if (destination < 0 || destination >= jobs.length) throw new Error("Build job cannot move beyond queue bounds");
+  const [job] = jobs.splice(index, 1);
+  if (!job) throw new Error("Build job disappeared during reorder");
+  jobs.splice(destination, 0, job);
+  return { jobs, details: { jobId: job.id, position: destination + 1 } };
+}
+
+const reorderJob = buildJobHandler<ReorderBuildJobPayload>(
+  "build.reorder-job", "build.job-reordered", (payload, state) => {
+    if (payload.direction !== -1 && payload.direction !== 1) {
+      throw new Error("Build reorder direction must be -1 or 1");
+    }
+    return moveJob(payload, state, payload.direction);
+  },
+);
+const prioritizeJob = buildJobHandler<BuildJobIdPayload>(
+  "build.prioritize-job", "build.job-reordered", (payload, state) => moveJob(payload, state),
+);
+
 export function createBuildCompilationLayer(
   options: BuildLayerOptions,
 ): SimulationLayer {
@@ -651,7 +823,7 @@ export function createBuildCompilationLayer(
       ),
       new BuildSystem(options),
     ],
-    commandHandlers: [createHardwareHandler()],
+    commandHandlers: [createHardwareHandler(), startJob, cancelJob, reorderJob, prioritizeJob],
     eventHandlers: [],
     feedbackLoops: [
       "Successful builds warm the cache and reduce later compute cost; debt invalidates those gains and increases failures.",

@@ -16,6 +16,7 @@ import {
   TECHNICAL_DEBT_LAYER_ID,
   TECHNICAL_DEBT_SYSTEM_ID,
   Resources,
+  ResourceRegistry,
   SimulationPhase,
   Simulation,
   appendBoundedCohort,
@@ -25,6 +26,7 @@ import {
   createCoreSimulationConfiguration,
   createVerticalSliceGame,
   decodeSave,
+  decodeSaveWithMetadata,
   encodeSave,
   getVerticalSliceStatus,
   hireAgents,
@@ -58,6 +60,7 @@ function configuration(seed = "test-seed"): SimulationConfiguration {
     resources: CORE_RESOURCE_DEFINITIONS,
     initialResources: {
       [Resources.Compute]: 0,
+      [Resources.Demand]: 40,
       [Resources.Money]: 1_000,
     },
     systems: modules.systems,
@@ -66,6 +69,26 @@ function configuration(seed = "test-seed"): SimulationConfiguration {
     eventHandlers: modules.eventHandlers,
   };
 }
+
+test("cached scoped resource views invalidate on restore and single mutations remain atomic", () => {
+  const registry = new ResourceRegistry(CORE_RESOURCE_DEFINITIONS, { [Resources.Money]: 10 });
+  const scope = new Set([Resources.Money]);
+  const previous = registry.viewPrepared(scope);
+  assert.equal(registry.viewPrepared(scope), previous);
+  scope.add(Resources.Source);
+  assert.throws(() => previous.get(Resources.Source), /Undeclared resource read/);
+  assert.equal(registry.view(scope).get(Resources.Source), 0);
+  assert.deepEqual(registry.applyTransaction([]), []);
+  assert.throws(() => registry.applyTransaction([
+    { resource: Resources.Money, amount: -11, reason: "Invalid" },
+  ]), /Insufficient Money/);
+  assert.equal(previous.get(Resources.Money), 10);
+  registry.applyTransaction([{ resource: Resources.Money, amount: -2, reason: "Cost" }]);
+  registry.restore({ [Resources.Money]: 5 });
+  assert.notEqual(registry.viewPrepared(scope), previous);
+  assert.equal(previous.get(Resources.Money), 8);
+  assert.equal(registry.viewPrepared(scope).get(Resources.Money), 5);
+});
 
 test("a tick processes the production dependency graph in order", () => {
   const simulation = new Simulation(configuration());
@@ -119,6 +142,9 @@ test("save envelopes verify integrity and migrate legacy snapshots", () => {
   source.advanceTicks(12);
   const encoded = encodeSave(source, 50_000);
   const restored = decodeSave(configuration("save-envelope"), encoded);
+  const metadata = decodeSaveWithMetadata(configuration("save-envelope"), encoded);
+  assert.equal(metadata.wallClockSavedAt, 50_000);
+  assert.deepEqual(metadata.simulation.serialize(50_000), source.serialize(50_000));
 
   assert.deepEqual(
     restored.serialize(50_000),
@@ -143,15 +169,16 @@ test("save envelopes verify integrity and migrate legacy snapshots", () => {
     schemaVersion: 2,
   } as Record<string, unknown>;
   delete legacy.durableEvents;
+  delete legacy.importantEvents;
   const migrated = migrateSnapshot(legacy);
-  assert.equal(migrated.schemaVersion, 4);
+  assert.equal(migrated.schemaVersion, 6);
   assert.deepEqual(migrated.durableEvents, []);
   assert.deepEqual(
     decodeSave(
       configuration("save-envelope"),
       JSON.stringify(legacy),
     ).serialize(50_000),
-    source.serialize(50_000),
+    { ...source.serialize(50_000), importantEvents: [] },
   );
 });
 
@@ -367,12 +394,23 @@ test("a failed tick rolls back all earlier stage mutations", () => {
     ...base,
     systems: [...base.systems, failingSystem],
   });
+  simulation.enableResourceFlowTelemetry();
+  simulation.dispatch({
+    id: "rolled-back-job", type: "build.start-job",
+    issuedAt: simTick(1), payload: { quantity: 3 },
+  });
+  const original = simulation.serialize(1_000);
 
   assert.throws(() => simulation.runTick(), /Insufficient Money/);
   assert.equal(simulation.tick, 0);
   assert.equal(simulation.resources.get(Resources.Money), 1_000);
   assert.equal(simulation.resources.get(Resources.Compute), 0);
   assert.equal(simulation.getState<FailingState>(failingSystem.id).attempts, 0);
+  assert.deepEqual(simulation.getResourceFlowTotals(), {
+    produced: {}, consumed: {}, discontinuities: 0,
+  });
+  assert.deepEqual(simulation.getImportantEvents(), []);
+  assert.deepEqual(simulation.serialize(1_000), original);
 });
 
 test("cyclic event-handler graphs are rejected", () => {

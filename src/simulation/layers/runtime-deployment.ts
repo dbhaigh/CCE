@@ -6,7 +6,7 @@ import {
   type SystemContext,
   type SystemUpdate,
 } from "../contracts.js";
-import { Resources } from "../resources.js";
+import { MAX_DEMAND_BACKLOG, Resources } from "../resources.js";
 import { type JsonObject } from "../types.js";
 import {
   appendBoundedCohort,
@@ -50,6 +50,8 @@ export interface RuntimeState extends JsonObject {
   readonly deployed: number;
   readonly revenue: number;
   readonly incidentsCreated: number;
+  readonly lastDemandServed?: number;
+  readonly lastDemandCreated?: number;
   readonly releaseCohorts: readonly ReleaseArtifactCohort[];
 }
 
@@ -70,6 +72,7 @@ class RuntimeSystem implements SimulationSystem<RuntimeState> {
   public readonly dependsOn = [TESTING_SYSTEM_ID];
   public readonly reads = [
     Resources.Releases,
+    Resources.Demand,
     Resources.Bugs,
     Resources.TestConfidence,
     Resources.Reputation,
@@ -79,6 +82,7 @@ class RuntimeSystem implements SimulationSystem<RuntimeState> {
   ];
   public readonly writes = [
     Resources.Releases,
+    Resources.Demand,
     Resources.Bugs,
     Resources.Money,
     Resources.Incidents,
@@ -99,6 +103,8 @@ class RuntimeSystem implements SimulationSystem<RuntimeState> {
       deployed: 0,
       revenue: 0,
       incidentsCreated: 0,
+      lastDemandServed: 0,
+      lastDemandCreated: 0,
       releaseCohorts: [],
     };
   }
@@ -263,8 +269,15 @@ class RuntimeSystem implements SimulationSystem<RuntimeState> {
       : 0;
     const reputation = view.resources.get(Resources.Reputation);
     const reputationBonus = Math.min(500, reputation);
+    const demand = view.resources.get(Resources.Demand);
+    const demandServed = Math.min(deployed, demand);
     const revenue = Math.floor(
-      (deployed * averageRevenue * (1_000 + reputationBonus)) / 1_000,
+      (demandServed * averageRevenue * (1_000 + reputationBonus)) / 1_000,
+    );
+    const successful = Math.max(0, demandServed - incidents);
+    const demandCreated = Math.min(
+      MAX_DEMAND_BACKLOG - demand + demandServed,
+      successful + Math.floor((successful * reputation) / 500),
     );
     const escapedBugs = Math.min(
       incidents,
@@ -279,6 +292,8 @@ class RuntimeSystem implements SimulationSystem<RuntimeState> {
 
     return {
       resources: [
+        { resource: Resources.Demand, amount: -demandServed, reason: "Deployed work satisfies market demand" },
+        { resource: Resources.Demand, amount: demandCreated, reason: "Successful deployment referrals" },
         {
           resource: Resources.Releases,
           amount: -deployed,
@@ -327,12 +342,14 @@ class RuntimeSystem implements SimulationSystem<RuntimeState> {
         deployed: state.deployed + deployed,
         revenue: state.revenue + revenue,
         incidentsCreated: state.incidentsCreated + incidents,
+        lastDemandServed: demandServed,
+        lastDemandCreated: demandCreated,
         releaseCohorts: remainingReleaseCohorts,
       },
       events: [
         {
           type: incidents > 0 ? "runtime.incident" : "runtime.deployed",
-          payload: { deployed, revenue, incidents, strategy: state.strategy },
+          payload: { deployed, revenue, incidents, strategy: state.strategy, demandServed, demandCreated },
         },
       ],
       telemetry: { status: "active", throughput: deployed },

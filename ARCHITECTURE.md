@@ -20,7 +20,168 @@ The architecture is built around these constraints:
   without modifying unrelated systems.
 - Save data is versioned independently from UI state and migrated explicitly.
 
-## 1. Core domains
+The engine lives in `src/simulation/`; `src/index.ts` preserves its package
+exports. The browser and Tauri desktop shell share the React UI in `src/app/`.
+One Web Worker owns the TypeScript simulation instance. The UI sends typed,
+ordered requests for initialization, real-time and offline advancement,
+commands, projections, and save serialization. Offline catch-up yields between
+bounded batches and reports progress without exporting mutable engine state.
+React calls Rust only for native save/load storage, receiving versioned save
+notifications over a Tauri event. Each snapshot enters the ordered worker
+queue at its save timestamp and flushes the preceding elapsed foreground or
+hidden time before serialization, including the fractional tick remainder.
+The frontend coalesces only completed snapshot writes *within the same slot*,
+not their worker request boundaries; Rust serializes writes with independent
+revisions for one autosave and three manual slots. Same-directory temporary
+files are synced and atomically replace existing Windows files; the prior
+valid primary is retained as an explicit backup and corrupt data never
+silently replaces that backup. Slot listings surface timestamp, empty/deleted,
+and corruption metadata. Existing single-file saves remain available as an
+autosave fallback until superseded; deleting the autosave masks that fallback
+without erasing it. The browser bridge follows the same slot separation and
+backup policy with `localStorage`, retaining per-slot revisions across browser
+reloads. A browser backup or revision write failure prevents primary
+replacement; a corrupted primary cannot replace a verified backup. A CCE-specific
+Rust command verifies the desktop backend before event subscriptions so a
+browser preview embedded in a different Tauri host uses browser storage.
+Playback rates live in the dependency-neutral worker protocol; preferences
+import it without a runtime dependency on the React store. A source-level
+runtime-import graph test guards against reintroducing this cycle.
+`src/app/simulation-store.ts` keeps immutable UI projections and selectively
+notifies React through `useSyncExternalStore`; the view includes all resource
+definitions, actual team and agent cohorts, build-stage execution totals, and
+resource/cohort-backed queue depths. `ResourceRateSampler` retains two worker
+projections for net stock deltas and committed kernel mutation totals for
+separate gross produced/consumed rates. The opt-in flow ledger is excluded
+from saves, commits only successful ticks, excludes ephemeral resets, and
+marks analytical-skip windows unmeasured instead of inventing gross flow.
+Debt diagnostics persist the last real maintenance decision: pre-spend
+capacity, spent capacity, knowledge/category-adjusted potential, funding cap
+and actual retirement. UI severity also considers the sampled net debt trend,
+not the already-consumed end-of-tick maintenance balance. The Radix-tabbed
+Tailwind dashboard provides seven
+discoverable sections with resource flow, agent staffing, a producer-selective
+manual build queue, policy editing, debt remediation, research selection,
+and optional paid research upgrades.
+Organization commands
+validate bounded team/swarm staffing, debit five ticks' onboarding cost,
+charge funded payroll each tick, and persist optional team focus in the
+canonical organization state. Focus uses the existing four team skill axes,
+modifying source, verification, operations, and research effectiveness rather
+than keeping a UI-only label. Training has a bounded skill cap and an upfront
+cost; team policy overrides can be cleared to resume global inheritance.
+The response budget and incident/debt/rebellion thresholds use the existing
+crisis protocol command, not client-side state. The reusable simulation loop in
+`src/app/simulation-loop.ts` is owned by `use-simulation-loop.ts`: one 250 ms
+timer serializes foreground worker advances, flushes elapsed time at the old
+speed when playback changes, pauses without accruing ticks, and orders a
+single offline catch-up on visibility restoration. A hide-time checkpoint
+flushes visible time; hidden timer autosaves are skipped so the last
+checkpoint remains replayable on crash, while a manual hidden save first
+advances its own offline interval. A constant
+10x Max cap is enforced by the worker; unchanged ticks do not create new UI
+projections. A load waits for earlier writes, initializes a new authoritative
+worker state from the chosen slot or explicit backup, and replays elapsed
+offline time once without carrying over the previous game's clock anchor.
+Visibility transitions while loading retain separate visible-speed and hidden
+offline intervals. Worker or render failures pause and block further canonical saves
+until explicit recovery; a failed transport is recreated before recovery.
+Settings and first-run completion live outside simulation snapshots, with a
+validated autosave cadence and a default playback speed for each new app
+session. No tray/background-ticking mode is installed: hidden/minimized
+windows retain the hide checkpoint plus exact resume/restart catch-up.
+Exact offline ticks use the same kernel and ordered queue. The worker yields
+between 256-tick batches using `MessageChannel` tasks (with timer fallback),
+with progress throttled to about 100 ms. Cached per-system access declarations
+and scoped resource views avoid repeated validation-set construction without
+loosening resource boundaries. A saved one-day/two-day catch-up (86,400 /
+172,800 exact ticks, Windows Node 24, single runs) measured 6.30 / 12.16 s
+before and 4.73 / 7.79 s after these changes. Worker FIFO commands cannot
+overtake a running offline catch-up; preserving all tick interactions remains
+the dominant cost. Final desktop validation measured 4.83 s for 86,400
+exact offline ticks with 45 progress reports and 184 ms for 600 10x ticks
+with a 100-engineer team (two worker yields). These single-run Node 24
+measurements depend on machine load, not a guarantee or a reward cap.
+
+The build layer owns at most 16 manual job requests (256 Source units each,
+1,000 units outstanding), ordered ahead of automatic builds. They do not
+reserve or create Source. Jobs can filter on one existing producing team or
+accept Any Source. The compilation pass selects eligible real Source cohorts
+in job order, then automatic builds use spare capacity, sharing the same
+compute, throughput, and binary buffer limits. Selected cohort policy changes
+actual build quality; unmatched team jobs do not obstruct other work.
+The default 1,000-unit Source cap also bounds its cohort count at 1,000, so
+new Source keeps team provenance without forced cross-team compaction.
+Older saves may already contain mixed-provenance `compacted` cohorts; those
+remain usable through Any Source or automatic work, not retroactively
+assignable to a team. Job progress attributes processed units, including
+failed batches. Job ordering/cancellation is
+deterministic, state is saved, and saves predating manual jobs default to
+an empty queue.
+Snapshot schema 6 additionally defaults preexisting jobs to Any Source.
+The research system saves optional one-time purchased upgrades separately
+from completed projects. A validated purchase spends Money and Knowledge
+after its project completes. `incremental-build-cache` reduces build compute
+per Source by one (floor one); `verified-ai-source` raises test strength of
+*new* AI-authored Source by 200/1,000 (ceiling 1,000). Neither upgrade
+duplicates the engine or alters already-produced Source.
+`core.demand` is a bounded 2,000-unit resource seeded to 40 requests.
+In the Source phase organic arrivals add one plus reputation/250 (integer
+part); authoring uses only backlog not already represented by Source,
+Binaries or Releases. Automation uses the same remaining-demand guard.
+Runtime later satisfies up to one request per deployed Release; revenue
+uses only that served quantity. Successful serviced deployments replenish
+requests, with a reputation-dependent referral bonus. The intrinsic organic
+arrival prevents early-game deadlock and the resource cap bounds growth;
+it is not a customer-segment, contract, or pricing simulator. Old saves
+migrate with demand covering their in-flight work, or the starting 40,
+whichever is greater.
+Maintenance commands queue a bounded category-specific request within the
+debt system; at the maintenance phase it spends only available generated
+capacity and Money at that category's knowledge-adjusted efficiency. Automatic
+retirement then uses any capacity and funding left, preserving category
+accounting and observed remediation telemetry. The kernel retains only 64
+selected important domain events, with recurrent alerts sampled at 30-tick
+intervals; the snapshot v5 migration initializes an empty log for older
+saves. This log is neither a full replay stream nor a UI notification queue.
+One-day/one-week baseline profiles before the demand rule change completed
+86,400/604,800 exact worker ticks in 7.315/34.724 seconds on this
+Windows/Node 24 host (single runs, zero analytical skips). Most sampled CPU
+time was JSON cloning/freezing in the deterministic tick kernel. An isolated
+state-patch cloning optimization did not improve these results (7.180/41.492
+seconds) and was reverted. Store reconciliation of 64 serialized events
+cost about 0.164 ms per projection over 2,000 local samples; the resource
+selector workload is bounded by 29 pre-demand resource definitions.
+Under the implemented demand rule, another single-run worker restore
+completed a day/week in 6.397/34.067 seconds with all 86,400/604,800
+ticks exact, 58/318 progress reports, and no analytical skips. Because
+market rules and system load changed, these measurements are **not**
+evidence of an optimized tick kernel or controlled before/after speedup.
+The existing 256-tick yielding/FIFO worker remains the safe exact
+implementation; JSON cloning and all active tick interactions still
+dominate long catch-ups. These are diagnostic measurements, not throughput
+claims or a reason to cap offline progression.
+In a repeatable three-run profile of the same final-rule saved game, one
+day took 5.032–5.924 s and one week 34.197–36.679 s. Of 4,064 sampled
+CPU leaf frames for one day, `cloneJson` consumed 26.1% (17.3% from
+state patches, 8.8% from event payloads); multi-resource
+`applyTransaction` consumed 8.9%, and `deepFreeze` another 6.2%.
+Replacing the small-transaction Map with linear lookup improved the
+one-day median but left the week median 34.697 s versus 34.497 s
+baseline. Skipping an event-validation Set on updates without events
+left the week median 34.188 s, also within run-to-run variation.
+Neither change was retained: no statistically convincing speedup was
+shown, and removing defensive cloning would change isolation and
+rollback guarantees. The worker still executes each dependent tick
+exactly once and cannot process later FIFO requests during catch-up.
+
+## 1. Core domains (extended design sketch)
+
+The following domain responsibility lists are **aspirational design context**,
+not a list of shipped mechanics. The implementation described above and in
+[GAME_MANUAL.md](GAME_MANUAL.md) is authoritative; customer segments,
+contracts, multi-language toolchains, individual defects, and generalized
+trigger-action automation are not implemented.
 
 ### Simulation kernel
 
@@ -631,7 +792,7 @@ public.
 ### Implemented layer modules
 
 The simulation package currently exposes nine `SimulationLayer` modules under
-`src/layers`. Each module publishes pipeline metadata, systems, command and
+`src/simulation/layers`. Each module publishes pipeline metadata, systems, command and
 event handlers, feedback-loop descriptions, and performance notes; its internal
 state is owned by its systems and is not imported by downstream layers.
 
